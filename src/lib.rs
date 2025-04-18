@@ -4,15 +4,17 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use log::{trace, warn};
+use log::{debug, trace, warn};
 use serde::{Deserialize, Serialize};
 use symlink::symlink_file;
 use thiserror::Error;
+use walkdir::DirEntry;
 
 #[derive(Debug, Serialize, Deserialize)]
 enum ActionType {
     Copy,
     Symlink,
+    NOP,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -34,7 +36,7 @@ impl Action {
     pub fn invert(&self) -> Self {
         return match self.action {
             ActionType::Copy => Action {
-                action: ActionType::Copy,
+                action: ActionType::NOP,
                 source: self.target.clone(),
                 target: self.source.clone(),
             },
@@ -42,6 +44,11 @@ impl Action {
                 action: ActionType::Copy,
                 source: self.target.clone(),
                 target: self.source.clone(),
+            },
+            ActionType::NOP => Action {
+                action: ActionType::NOP,
+                source: self.source.clone(),
+                target: self.target.clone(),
             },
         };
     }
@@ -60,8 +67,12 @@ pub struct MirageState {
 
 impl MirageState {
     pub fn get<T: AsRef<Path>>(target_dir: T) -> Result<MirageState, MirageError> {
+        // convert path to absolute path
+        let target_dir = fs::canonicalize(target_dir.as_ref())?;
+        debug!("Target dir is {:?}", target_dir);
+
         // create .mirage if does not exist
-        let mirage_path = target_dir.as_ref().join(".mirage");
+        let mirage_path = target_dir.join(".mirage");
         if mirage_path.exists() && !mirage_path.is_dir() {
             return Err(MirageError::DotMirageError);
         }
@@ -89,14 +100,36 @@ impl MirageState {
             return Err(MirageError::WALError);
         }
 
-        let file = OpenOptions::new().read(true).create(true).open(&wal_path)?;
+        debug!("Opening wal file {:?}", wal_path);
 
-        let wal = serde_json::from_reader(BufReader::new(file))?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&wal_path)?;
 
-        Ok(MirageState {
-            source_path: mirage_path,
-            wal,
-        })
+        debug!("Reading wal file {:?}", wal_path);
+
+        if file.metadata()?.len() == 0 {
+            debug!("File is empty, creating new wal");
+            let wal = WAL {
+                actions: Vec::new(),
+            };
+            serde_json::to_writer_pretty(BufWriter::new(file), &wal)?;
+            return Ok(MirageState {
+                source_path: mirage_path,
+                wal,
+            });
+        } else {
+            debug!("File is not empty, reading wal");
+
+            let wal = serde_json::from_reader(BufReader::new(file))?;
+
+            Ok(MirageState {
+                source_path: mirage_path,
+                wal,
+            })
+        }
     }
 
     pub fn commit(&self) -> Result<(), MirageError> {
@@ -129,7 +162,18 @@ pub enum MirageError {
 pub fn apply<T: AsRef<Path>>(target_dir: T) -> Result<(), MirageError> {
     let mut state = MirageState::get(&target_dir)?;
 
-    for here in walkdir::WalkDir::new(&target_dir) {
+    fn is_hidden(entry: &DirEntry) -> bool {
+        entry
+            .file_name()
+            .to_str()
+            .map(|s| s.starts_with("."))
+            .unwrap_or(false)
+    }
+
+    for here in walkdir::WalkDir::new(&target_dir)
+        .into_iter()
+        .filter_entry(|f| !is_hidden(f))
+    {
         // handle soft errors here
         if let Err(x) = here {
             warn!("Can't access {:?} due to {:?}", x.path(), x.io_error());
@@ -144,8 +188,13 @@ pub fn apply<T: AsRef<Path>>(target_dir: T) -> Result<(), MirageError> {
             trace!("Skipping dir {:?}", here.path());
             continue;
         }
+        let here = fs::canonicalize(here.path())?;
+        debug!("Processing file {}", here.display());
         // compare with hash of other entries
-        for there in walkdir::WalkDir::new(&target_dir) {
+        for there in walkdir::WalkDir::new(&target_dir)
+            .into_iter()
+            .filter_entry(|f| !is_hidden(f))
+        {
             if let Err(x) = there {
                 warn!("Can't access {:?} due to {:?}", x.path(), x.io_error());
                 continue;
@@ -155,26 +204,29 @@ pub fn apply<T: AsRef<Path>>(target_dir: T) -> Result<(), MirageError> {
                 trace!("Skipping symlink {:?}", there.path());
                 continue;
             }
-            if here.path() == there.path() {
-                continue;
-            }
+
             if there.file_type().is_dir() {
                 trace!("Skipping dir {:?}", there.path());
                 continue;
             }
-            let is_same = check_if_files_are_same(here.path(), there.path())?;
+            let there: PathBuf = fs::canonicalize(there.path())?;
+            if here.as_path() == there.as_path() {
+                continue;
+            }
+            debug!("Comparing file {} with {}", here.display(), there.display());
+            let is_same = check_if_files_are_same(here.as_path(), there.as_path())?;
             if is_same {
-                trace!("Files are same {:?} {:?}", here.path(), there.path());
+                trace!("Files are same {:?} {:?}", here.as_path(), there.as_path());
                 // move first file into originals and point both files using symlinks
                 // first write to WAL
                 let original_path = state.source_path.join("originals");
 
                 //TODO handle this unwrap nicely
-                let original_path = original_path.join(here.path().file_name().unwrap());
+                let original_path = original_path.join(here.as_path().file_name().unwrap());
 
                 let action = Action::new(
                     ActionType::Copy,
-                    here.path().to_path_buf(),
+                    here.as_path().to_path_buf(),
                     original_path.clone(),
                 );
 
@@ -182,7 +234,7 @@ pub fn apply<T: AsRef<Path>>(target_dir: T) -> Result<(), MirageError> {
 
                 let action = Action::new(
                     ActionType::Symlink,
-                    here.path().to_path_buf(),
+                    here.as_path().to_path_buf(),
                     original_path.clone(),
                 );
 
@@ -190,7 +242,7 @@ pub fn apply<T: AsRef<Path>>(target_dir: T) -> Result<(), MirageError> {
 
                 let action = Action::new(
                     ActionType::Symlink,
-                    there.path().to_path_buf(),
+                    there.as_path().to_path_buf(),
                     original_path.clone(),
                 );
 
@@ -200,13 +252,13 @@ pub fn apply<T: AsRef<Path>>(target_dir: T) -> Result<(), MirageError> {
 
                 // now do what we said in actions
 
-                fs::copy(here.path(), original_path.as_path())?;
+                fs::copy(here.as_path(), original_path.as_path())?;
 
-                fs::remove_file(here.path())?;
-                fs::remove_file(there.path())?;
+                fs::remove_file(here.as_path())?;
+                fs::remove_file(there.as_path())?;
 
-                symlink_file(original_path.as_path(), here.path())?;
-                symlink_file(original_path.as_path(), there.path())?;
+                symlink_file(original_path.as_path(), here.as_path())?;
+                symlink_file(original_path.as_path(), there.as_path())?;
             }
         }
     }
@@ -216,14 +268,24 @@ pub fn apply<T: AsRef<Path>>(target_dir: T) -> Result<(), MirageError> {
 pub fn revert<T: AsRef<Path>>(target_dir: T) -> Result<(), MirageError> {
     let state = MirageState::get(&target_dir)?;
 
-    for action in state.wal.actions.iter().rev() {
-        let revert_action = action.invert();
-        match revert_action.action {
+    for action in state.wal.actions.iter().rev().map(|f| f.invert()) {
+        match action.action {
             ActionType::Copy => {
+                debug!(
+                    "Copying file from {:?} to {:?}",
+                    action.source, action.target
+                );
+                if action.target.exists() {
+                    fs::remove_file(action.target.as_path())?;
+                }
                 fs::copy(action.source.as_path(), action.target.as_path())?;
             }
             ActionType::Symlink => {
                 symlink_file(action.source.as_path(), action.target.as_path())?;
+            }
+            ActionType::NOP => {
+                // do nothing
+                debug!("NOP action, doing nothing");
             }
         }
     }

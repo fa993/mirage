@@ -1,1 +1,4 @@
 /target
+test_dir
+init_test.sh
+.DS_Store

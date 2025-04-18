@@ -32,14 +32,14 @@ fn main() {
         Commands::Apply { path } => {
             println!("Applying deduplication to path: {}", path);
             apply(path).unwrap_or_else(|err| {
-                eprintln!("Error applying deduplication: {}", err);
+                eprintln!("Error applying deduplication: {:?}", err);
                 std::process::exit(1);
             });
         }
         Commands::Revert { path } => {
             println!("Reverting deduplication to path: {}", path);
             revert(path).unwrap_or_else(|err| {
-                eprintln!("Error reverting deduplication: {}", err);
+                eprintln!("Error reverting deduplication: {:?}", err);
                 std::process::exit(1);
             });
         }
