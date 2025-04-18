@@ -1,0 +1,283 @@
+use std::{
+    fs::{self, create_dir, File, OpenOptions},
+    io::{self, BufReader, BufWriter, Read},
+    path::{Path, PathBuf},
+};
+
+use log::{trace, warn};
+use serde::{Deserialize, Serialize};
+use symlink::symlink_file;
+use thiserror::Error;
+
+#[derive(Debug, Serialize, Deserialize)]
+enum ActionType {
+    Copy,
+    Symlink,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Action {
+    action: ActionType,
+    source: PathBuf,
+    target: PathBuf,
+}
+
+impl Action {
+    pub fn new(action: ActionType, source: PathBuf, target: PathBuf) -> Self {
+        Action {
+            action,
+            source,
+            target,
+        }
+    }
+
+    pub fn invert(&self) -> Self {
+        return match self.action {
+            ActionType::Copy => Action {
+                action: ActionType::Copy,
+                source: self.target.clone(),
+                target: self.source.clone(),
+            },
+            ActionType::Symlink => Action {
+                action: ActionType::Copy,
+                source: self.target.clone(),
+                target: self.source.clone(),
+            },
+        };
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WAL {
+    actions: Vec<Action>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct MirageState {
+    source_path: PathBuf,
+    wal: WAL,
+}
+
+impl MirageState {
+    pub fn get<T: AsRef<Path>>(target_dir: T) -> Result<MirageState, MirageError> {
+        // create .mirage if does not exist
+        let mirage_path = target_dir.as_ref().join(".mirage");
+        if mirage_path.exists() && !mirage_path.is_dir() {
+            return Err(MirageError::DotMirageError);
+        }
+        if !mirage_path.exists() {
+            create_dir(&mirage_path)?;
+        }
+        if !(mirage_path.exists() && mirage_path.is_dir()) {
+            return Err(MirageError::DotMirageInInconsistentState);
+        }
+
+        // create director .mirage/originals if does not exist
+        let originals_path = mirage_path.join("originals");
+        if originals_path.exists() && !originals_path.is_dir() {
+            return Err(MirageError::DotMirageError);
+        }
+        if !originals_path.exists() {
+            create_dir(&originals_path)?;
+        }
+
+        // now create .mirage/wal.json
+
+        let wal_path = mirage_path.join("wal.json");
+
+        if wal_path.exists() && !wal_path.is_file() {
+            return Err(MirageError::WALError);
+        }
+
+        let file = OpenOptions::new().read(true).create(true).open(&wal_path)?;
+
+        let wal = serde_json::from_reader(BufReader::new(file))?;
+
+        Ok(MirageState {
+            source_path: mirage_path,
+            wal,
+        })
+    }
+
+    pub fn commit(&self) -> Result<(), MirageError> {
+        let wal_path = self.source_path.join("wal.json");
+        let file = OpenOptions::new()
+            .truncate(true)
+            .write(true)
+            .open(wal_path)?;
+        serde_json::to_writer_pretty(BufWriter::new(file), &self.wal)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum MirageError {
+    #[error("Couldn't create fs resource")]
+    ErrorDuringIO(#[from] io::Error),
+    #[error(".mirage exists and is not dir")]
+    DotMirageError,
+    #[error("inconsistent state error")]
+    DotMirageInInconsistentState,
+    #[error(".mirage/wal.json exists and is not file")]
+    WALError,
+    #[error("error in encoding/decoding json")]
+    JsonError(#[from] serde_json::Error),
+    #[error("error in listing files")]
+    WalkDirError(#[from] walkdir::Error),
+}
+
+pub fn apply<T: AsRef<Path>>(target_dir: T) -> Result<(), MirageError> {
+    let mut state = MirageState::get(&target_dir)?;
+
+    for here in walkdir::WalkDir::new(&target_dir) {
+        // handle soft errors here
+        if let Err(x) = here {
+            warn!("Can't access {:?} due to {:?}", x.path(), x.io_error());
+            continue;
+        }
+        let here = here.unwrap();
+        if here.path_is_symlink() {
+            trace!("Skipping symlink {:?}", here.path());
+            continue;
+        }
+        if here.file_type().is_dir() {
+            trace!("Skipping dir {:?}", here.path());
+            continue;
+        }
+        // compare with hash of other entries
+        for there in walkdir::WalkDir::new(&target_dir) {
+            if let Err(x) = there {
+                warn!("Can't access {:?} due to {:?}", x.path(), x.io_error());
+                continue;
+            }
+            let there = there.unwrap();
+            if there.path_is_symlink() {
+                trace!("Skipping symlink {:?}", there.path());
+                continue;
+            }
+            if here.path() == there.path() {
+                continue;
+            }
+            if there.file_type().is_dir() {
+                trace!("Skipping dir {:?}", there.path());
+                continue;
+            }
+            let is_same = check_if_files_are_same(here.path(), there.path())?;
+            if is_same {
+                trace!("Files are same {:?} {:?}", here.path(), there.path());
+                // move first file into originals and point both files using symlinks
+                // first write to WAL
+                let original_path = state.source_path.join("originals");
+
+                //TODO handle this unwrap nicely
+                let original_path = original_path.join(here.path().file_name().unwrap());
+
+                let action = Action::new(
+                    ActionType::Copy,
+                    here.path().to_path_buf(),
+                    original_path.clone(),
+                );
+
+                state.wal.actions.push(action);
+
+                let action = Action::new(
+                    ActionType::Symlink,
+                    here.path().to_path_buf(),
+                    original_path.clone(),
+                );
+
+                state.wal.actions.push(action);
+
+                let action = Action::new(
+                    ActionType::Symlink,
+                    there.path().to_path_buf(),
+                    original_path.clone(),
+                );
+
+                state.wal.actions.push(action);
+
+                state.commit()?;
+
+                // now do what we said in actions
+
+                fs::copy(here.path(), original_path.as_path())?;
+
+                fs::remove_file(here.path())?;
+                fs::remove_file(there.path())?;
+
+                symlink_file(original_path.as_path(), here.path())?;
+                symlink_file(original_path.as_path(), there.path())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn revert<T: AsRef<Path>>(target_dir: T) -> Result<(), MirageError> {
+    let state = MirageState::get(&target_dir)?;
+
+    for action in state.wal.actions.iter().rev() {
+        let revert_action = action.invert();
+        match revert_action.action {
+            ActionType::Copy => {
+                fs::copy(action.source.as_path(), action.target.as_path())?;
+            }
+            ActionType::Symlink => {
+                symlink_file(action.source.as_path(), action.target.as_path())?;
+            }
+        }
+    }
+
+    // remove .mirage directory
+
+    let mirage_path = state.source_path;
+    if mirage_path.exists() {
+        fs::remove_dir_all(mirage_path)?;
+    }
+
+    Ok(())
+}
+
+pub fn check_if_files_are_same(here: &Path, there: &Path) -> Result<bool, MirageError> {
+    // compare hashes of files
+    let h_meta = here.metadata()?;
+    let t_meta = there.metadata()?;
+    if h_meta.len() != t_meta.len() {
+        return Ok(false);
+    }
+    return full_match(here, there);
+    // Ok(here_hash == there_hash)
+}
+
+pub fn full_match(here: &Path, there: &Path) -> Result<bool, MirageError> {
+    let file1 = File::open(here)?;
+    let mut reader1 = BufReader::new(file1);
+    let file2 = File::open(there)?;
+    let mut reader2 = BufReader::new(file2);
+    let mut buf1 = [0; 10000];
+    let mut buf2 = [0; 10000];
+    loop {
+        if let Result::Ok(n1) = reader1.read(&mut buf1) {
+            if n1 > 0 {
+                if let Result::Ok(n2) = reader2.read(&mut buf2) {
+                    if n1 == n2 {
+                        if buf1 == buf2 {
+                            continue;
+                        }
+                    }
+                    trace!("not equal");
+                    return Ok(false);
+                }
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    trace!("equal");
+    return Ok(true);
+}
+
+#[cfg(test)]
+mod tests {}
