@@ -314,9 +314,6 @@ pub fn apply<T: AsRef<Path>>(target_dir: T) -> Result<(), MirageError> {
                     "Copying file from {:?} to {:?}",
                     action.source, action.target
                 );
-                if action.target.exists() {
-                    fs::remove_file(action.target.as_path())?;
-                }
                 fs::copy(action.source.as_path(), action.target.as_path())?;
             }
             ActionType::Symlink => {
@@ -345,13 +342,21 @@ pub fn apply<T: AsRef<Path>>(target_dir: T) -> Result<(), MirageError> {
 pub fn revert<T: AsRef<Path>>(target_dir: T) -> Result<(), MirageError> {
     let state = MirageState::get(&target_dir)?;
 
-    for action in state.wal.actions.iter().rev().map(|f| f.invert()) {
+    for action in state
+        .wal
+        .actions
+        .iter()
+        .rev()
+        .skip(state.wal.actions.len() - state.wal.checkpoint)
+        .map(|f| f.invert())
+    {
         match action.action {
             ActionType::Copy => {
                 debug!(
                     "Copying file from {:?} to {:?}",
                     action.source, action.target
                 );
+                // TODO: this shouldn't be dangerous as target will always be symlinks
                 if action.target.exists() {
                     fs::remove_file(action.target.as_path())?;
                 }
