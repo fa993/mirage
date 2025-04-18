@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs::{self, create_dir, File, OpenOptions},
     io::{self, BufReader, BufWriter, Read},
     path::{Path, PathBuf},
@@ -54,9 +55,11 @@ impl Action {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 struct WAL {
     actions: Vec<Action>,
+    redirections: HashMap<PathBuf, PathBuf>,
+    checkpoint: usize,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -112,9 +115,7 @@ impl MirageState {
 
         if file.metadata()?.len() == 0 {
             debug!("File is empty, creating new wal");
-            let wal = WAL {
-                actions: Vec::new(),
-            };
+            let wal = WAL::default();
             serde_json::to_writer_pretty(BufWriter::new(file), &wal)?;
             return Ok(MirageState {
                 source_path: mirage_path,
@@ -217,6 +218,49 @@ pub fn apply<T: AsRef<Path>>(target_dir: T) -> Result<(), MirageError> {
             let is_same = check_if_files_are_same(here.as_path(), there.as_path())?;
             if is_same {
                 trace!("Files are same {:?} {:?}", here.as_path(), there.as_path());
+
+                // first check if redirection exists
+
+                let contains_1 = state.wal.redirections.contains_key(here.as_path());
+                let contains_2 = state.wal.redirections.contains_key(there.as_path());
+
+                if contains_1 && contains_2 {
+                    debug!("Redirection exists, skipping {:?}", here.as_path());
+                    continue;
+                } else if contains_1 {
+                    // just create a symlink to where here points to for there
+                    let here_pt = state.wal.redirections.get(here.as_path()).unwrap();
+                    let action = Action::new(
+                        ActionType::Symlink,
+                        there.as_path().to_path_buf(),
+                        here_pt.clone(),
+                    );
+                    state.wal.actions.push(action);
+                    state
+                        .wal
+                        .redirections
+                        .insert(there.as_path().to_path_buf(), here_pt.clone());
+                    state.commit()?;
+                    debug!("Redirection exists, using it {:?}", here.as_path());
+                    continue;
+                } else if contains_2 {
+                    // just create a symlink to where there points to for here
+                    let there_pt = state.wal.redirections.get(there.as_path()).unwrap();
+                    let action = Action::new(
+                        ActionType::Symlink,
+                        here.as_path().to_path_buf(),
+                        there_pt.clone(),
+                    );
+                    state.wal.actions.push(action);
+                    state
+                        .wal
+                        .redirections
+                        .insert(here.as_path().to_path_buf(), there_pt.clone());
+                    state.commit()?;
+                    debug!("Redirection exists, using it {:?}", there.as_path());
+                    continue;
+                }
+
                 // move first file into originals and point both files using symlinks
                 // first write to WAL
                 let original_path = state.source_path.join("originals");
@@ -248,20 +292,53 @@ pub fn apply<T: AsRef<Path>>(target_dir: T) -> Result<(), MirageError> {
 
                 state.wal.actions.push(action);
 
+                state
+                    .wal
+                    .redirections
+                    .insert(here.as_path().to_path_buf(), original_path.clone());
+
+                state
+                    .wal
+                    .redirections
+                    .insert(there.as_path().to_path_buf(), original_path.clone());
+
                 state.commit()?;
-
-                // now do what we said in actions
-
-                fs::copy(here.as_path(), original_path.as_path())?;
-
-                fs::remove_file(here.as_path())?;
-                fs::remove_file(there.as_path())?;
-
-                symlink_file(original_path.as_path(), here.as_path())?;
-                symlink_file(original_path.as_path(), there.as_path())?;
             }
         }
     }
+
+    for action in state.wal.actions.iter().skip(state.wal.checkpoint) {
+        match action.action {
+            ActionType::Copy => {
+                debug!(
+                    "Copying file from {:?} to {:?}",
+                    action.source, action.target
+                );
+                if action.target.exists() {
+                    fs::remove_file(action.target.as_path())?;
+                }
+                fs::copy(action.source.as_path(), action.target.as_path())?;
+            }
+            ActionType::Symlink => {
+                debug!(
+                    "Creating symlink from {:?} to {:?}",
+                    action.source, action.target
+                );
+                if action.source.exists() {
+                    fs::remove_file(action.source.as_path())?;
+                }
+                // horrible convention should fix
+                symlink_file(action.target.as_path(), action.source.as_path())?;
+            }
+            ActionType::NOP => {
+                // do nothing
+                debug!("NOP action, doing nothing");
+            }
+        }
+        state.wal.checkpoint += 1;
+        state.commit()?;
+    }
+
     Ok(())
 }
 
