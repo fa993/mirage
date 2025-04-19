@@ -579,7 +579,7 @@ mod tests {
 
     #[test]
     fn simple_test() {
-        pretty_env_logger::init();
+        // pretty_env_logger::init();
         let dir = tempdir().unwrap();
         let dir_path = dir.path();
 
@@ -636,6 +636,116 @@ mod tests {
             .get_fs_metadata()
             .file_type()
             .is_file());
+
+        revert(&dir_path).unwrap();
+
+        test_view.verify();
+
+        // Check if mirage directory is removed
+
+        assert!(!dir_path.join(".mirage").exists());
+        assert!(!dir_path.join(".mirage/originals").exists());
+        assert!(!dir_path.join(".mirage/wal.json").exists());
+    }
+
+    #[test]
+    fn complex_test() {
+        // pretty_env_logger::init();
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+
+        let test_dir = TestFsObject::Dir {
+            name: "test_dir".to_string(),
+            contents: vec![
+                TestFsObject::File {
+                    name: "file1.txt".to_string(),
+                    contents: "duplicate content".to_string(),
+                },
+                TestFsObject::File {
+                    name: "file2.txt".to_string(),
+                    contents: "duplicate content".to_string(),
+                },
+                TestFsObject::File {
+                    name: "file3.txt".to_string(),
+                    contents: "unique content".to_string(),
+                },
+                TestFsObject::Dir {
+                    name: "subdir".to_string(),
+                    contents: vec![
+                        TestFsObject::File {
+                            name: "file4.txt".to_string(),
+                            contents: "duplicate content".to_string(),
+                        },
+                        TestFsObject::File {
+                            name: "file5.txt".to_string(),
+                            contents: "unique content".to_string(),
+                        },
+                    ],
+                },
+            ],
+        };
+
+        test_dir.create(dir_path);
+
+        let test_view = test_dir.get_view(dir_path);
+
+        let dir_path = test_dir.get_path(dir_path);
+
+        apply(&dir_path).unwrap();
+
+        let originals_dir = dir_path.join(".mirage/originals");
+
+        // file1 should now be in .mirage/originals
+        let orig1 = originals_dir.join("file1.txt");
+        assert!(orig1.exists());
+
+        let orig3 = originals_dir.join("file3.txt");
+        assert!(orig3.exists());
+
+        // file1 should now be a symlink to file1 in .mirage/originals
+        assert!(test_view.get_children()[0].is_symlink());
+
+        assert!(test_view.get_children()[1].is_symlink());
+
+        assert!(test_view.get_children()[2].is_symlink());
+
+        assert!(test_view.get_children()[3].get_children()[0].is_symlink());
+
+        assert!(test_view.get_children()[3].get_children()[1].is_symlink());
+
+        assert_eq!(
+            fs::canonicalize(read_link(&test_view.get_children()[0].get_full_path()).unwrap())
+                .unwrap(),
+            fs::canonicalize(&orig1).unwrap()
+        );
+
+        assert_eq!(
+            fs::canonicalize(read_link(&test_view.get_children()[1].get_full_path()).unwrap())
+                .unwrap(),
+            fs::canonicalize(&orig1).unwrap()
+        );
+
+        assert_eq!(
+            fs::canonicalize(
+                read_link(&test_view.get_children()[3].get_children()[0].get_full_path()).unwrap()
+            )
+            .unwrap(),
+            fs::canonicalize(&orig1).unwrap()
+        );
+
+        assert_eq!(
+            fs::canonicalize(read_link(&test_view.get_children()[2].get_full_path()).unwrap())
+                .unwrap(),
+            fs::canonicalize(&orig3).unwrap()
+        );
+
+        assert_eq!(
+            fs::canonicalize(
+                read_link(&test_view.get_children()[3].get_children()[1].get_full_path()).unwrap()
+            )
+            .unwrap(),
+            fs::canonicalize(&orig3).unwrap()
+        );
 
         revert(&dir_path).unwrap();
 
