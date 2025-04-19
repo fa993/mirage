@@ -430,6 +430,7 @@ pub fn full_match(here: &Path, there: &Path) -> Result<bool, MirageError> {
 #[cfg(test)]
 mod tests {
     use std::fs::{self, read_link, File};
+    use std::io::Read;
     use std::io::Write;
 
     use tempfile::tempdir;
@@ -500,18 +501,38 @@ mod tests {
         assert!(file3_path.exists());
 
         // Check if the symlinks are removed
-        assert!(!fs::symlink_metadata(&file1_path)
+        assert!(fs::symlink_metadata(&file1_path)
             .unwrap()
             .file_type()
-            .is_symlink());
-        assert!(!fs::symlink_metadata(&file2_path)
+            .is_file());
+        assert!(fs::symlink_metadata(&file2_path)
             .unwrap()
             .file_type()
-            .is_symlink());
-        assert!(!fs::symlink_metadata(&file3_path)
+            .is_file());
+        assert!(fs::symlink_metadata(&file3_path)
             .unwrap()
             .file_type()
-            .is_symlink());
+            .is_file());
+
+        // Check if contents are the same
+        let mut file1_content = String::new();
+        let mut file2_content = String::new();
+        let mut file3_content = String::new();
+        File::open(&file1_path)
+            .unwrap()
+            .read_to_string(&mut file1_content)
+            .unwrap();
+        File::open(&file2_path)
+            .unwrap()
+            .read_to_string(&mut file2_content)
+            .unwrap();
+        File::open(&file3_path)
+            .unwrap()
+            .read_to_string(&mut file3_content)
+            .unwrap();
+        assert_eq!(file1_content, "duplicate content");
+        assert_eq!(file2_content, "duplicate content");
+        assert_eq!(file3_content, "unique content");
 
         // Check if mirage directory is removed
 
