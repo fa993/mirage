@@ -163,18 +163,20 @@ pub enum MirageError {
 pub fn apply<T: AsRef<Path>>(target_dir: T) -> Result<(), MirageError> {
     let mut state = MirageState::get(&target_dir)?;
 
-    fn is_hidden(entry: &DirEntry) -> bool {
+    fn is_mirage(entry: &DirEntry) -> bool {
         entry
             .file_name()
             .to_str()
-            .map(|s| s.starts_with("."))
+            .map(|s| s.starts_with(".mirage"))
             .unwrap_or(false)
     }
 
     for here in walkdir::WalkDir::new(&target_dir)
+        .sort_by_file_name()
         .into_iter()
-        .filter_entry(|f| !is_hidden(f))
+        .filter_entry(|f| !is_mirage(f))
     {
+        debug!("Try Processing file {:?}", here);
         // handle soft errors here
         if let Err(x) = here {
             warn!("Can't access {:?} due to {:?}", x.path(), x.io_error());
@@ -193,9 +195,11 @@ pub fn apply<T: AsRef<Path>>(target_dir: T) -> Result<(), MirageError> {
         debug!("Processing file {}", here.display());
         // compare with hash of other entries
         for there in walkdir::WalkDir::new(&target_dir)
+            .sort_by_file_name()
             .into_iter()
-            .filter_entry(|f| !is_hidden(f))
+            .filter_entry(|f| !is_mirage(f))
         {
+            debug!("Try Comparing file {:?}", here);
             if let Err(x) = there {
                 warn!("Can't access {:?} due to {:?}", x.path(), x.io_error());
                 continue;
@@ -424,4 +428,95 @@ pub fn full_match(here: &Path, there: &Path) -> Result<bool, MirageError> {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use std::fs::{self, read_link, File};
+    use std::io::Write;
+
+    use tempfile::tempdir;
+
+    use crate::{apply, revert};
+
+    #[test]
+    fn simple_test() {
+        pretty_env_logger::init();
+        let dir = tempdir().unwrap();
+        let dir_path = dir.path();
+
+        let file1_path = dir_path.join("file1.txt");
+        let file2_path = dir_path.join("file2.txt");
+        let file3_path = dir_path.join("file3.txt");
+
+        // Create test files
+        {
+            let mut f1 = File::create(&file1_path).unwrap();
+            write!(f1, "duplicate content").unwrap();
+
+            let mut f2 = File::create(&file2_path).unwrap();
+            write!(f2, "duplicate content").unwrap();
+
+            let mut f3 = File::create(&file3_path).unwrap();
+            write!(f3, "unique content").unwrap();
+
+            f1.flush().unwrap();
+            f2.flush().unwrap();
+            f3.flush().unwrap();
+        }
+
+        apply(dir_path).unwrap();
+
+        let originals_dir = dir_path.join(".mirage/originals");
+
+        // file1 should now be in .mirage/originals
+        let orig1 = originals_dir.join("file1.txt");
+        assert!(orig1.exists());
+
+        // file1 should now be a symlink to file1 in .mirage/originals
+        assert!(fs::symlink_metadata(&file1_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        assert!(fs::symlink_metadata(&file2_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        assert_eq!(
+            fs::canonicalize(read_link(&file2_path).unwrap()).unwrap(),
+            fs::canonicalize(orig1).unwrap()
+        );
+
+        assert!(fs::symlink_metadata(&file3_path)
+            .unwrap()
+            .file_type()
+            .is_file());
+
+        revert(dir_path).unwrap();
+
+        // Check if the original files are restored
+
+        assert!(file1_path.exists());
+        assert!(file2_path.exists());
+        assert!(file3_path.exists());
+
+        // Check if the symlinks are removed
+        assert!(!fs::symlink_metadata(&file1_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!fs::symlink_metadata(&file2_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!fs::symlink_metadata(&file3_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        // Check if mirage directory is removed
+
+        assert!(!dir_path.join(".mirage").exists());
+        assert!(!dir_path.join(".mirage/originals").exists());
+        assert!(!dir_path.join(".mirage/wal.json").exists());
+    }
+}

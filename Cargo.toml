@@ -14,3 +14,6 @@ serde_json = "1.0.140"
 symlink = "0.1.0"
 thiserror = "2.0.12"
 walkdir = "2.5.0"
+
+[dev-dependencies]
+tempfile = "3.19.1"
