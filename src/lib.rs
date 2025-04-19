@@ -432,10 +432,150 @@ mod tests {
     use std::fs::{self, read_link, File};
     use std::io::Read;
     use std::io::Write;
+    use std::path::{Path, PathBuf};
 
+    use log::debug;
     use tempfile::tempdir;
 
     use crate::{apply, revert};
+
+    enum TestFsObject {
+        File {
+            name: String,
+            contents: String,
+        },
+        Dir {
+            name: String,
+            contents: Vec<TestFsObject>,
+        },
+    }
+
+    struct TestFsView<'a> {
+        base_obj: &'a TestFsObject,
+        base_path: PathBuf,
+    }
+
+    impl<'a> TestFsView<'a> {
+        fn new(base_obj: &'a TestFsObject, base_path: PathBuf) -> Self {
+            TestFsView {
+                base_obj,
+                base_path,
+            }
+        }
+
+        fn get_children(&self) -> Vec<TestFsView> {
+            self.base_obj
+                .get_children()
+                .into_iter()
+                .map(|f| TestFsView::new(f, self.base_path.join(self.base_obj.get_name())))
+                .collect::<Vec<_>>()
+        }
+
+        fn is_symlink(&self) -> bool {
+            self.base_obj.is_symlink(&self.base_path)
+        }
+
+        fn get_fs_metadata(&self) -> fs::Metadata {
+            self.base_obj.get_path(&self.base_path).metadata().unwrap()
+        }
+
+        fn get_full_path(&self) -> PathBuf {
+            self.base_obj.get_path(&self.base_path)
+        }
+
+        fn verify(&self) {
+            // verify that the structure is correct that files are not symlinks
+            // verify that the contents are correct
+            // verify that directories are not symlinks
+
+            // verify that the contents are correct
+            if self.base_obj.is_symlink(&self.base_path) {
+                panic!("Object is a symlink");
+            }
+            if self.get_fs_metadata().file_type().is_dir() {
+                for child in self.get_children() {
+                    child.verify();
+                }
+            } else {
+                let mut file = File::open(self.get_full_path()).unwrap();
+                let mut contents = String::new();
+                file.read_to_string(&mut contents).unwrap();
+                assert_eq!(contents, self.base_obj.get_contents());
+            }
+        }
+    }
+
+    impl TestFsObject {
+        fn get_view(&self, base_path: &Path) -> TestFsView {
+            TestFsView::new(self, base_path.to_path_buf())
+        }
+
+        fn create(&self, base_path: &Path) {
+            match self {
+                TestFsObject::File { name, contents } => {
+                    let file_path = base_path.join(name);
+                    let mut file = File::create(file_path).unwrap();
+                    file.write_all(contents.as_bytes()).unwrap();
+                    file.flush().unwrap();
+                    file.sync_all().unwrap();
+                }
+                TestFsObject::Dir { name, contents } => {
+                    let dir_path = base_path.join(name);
+                    fs::create_dir(&dir_path).unwrap();
+                    for content in contents {
+                        content.create(&dir_path);
+                    }
+                }
+            }
+        }
+
+        fn get_path(&self, base_path: &Path) -> PathBuf {
+            match self {
+                TestFsObject::File { name, .. } => base_path.join(name),
+                TestFsObject::Dir { name, .. } => base_path.join(name),
+            }
+        }
+
+        fn get_contents(&self) -> &str {
+            match self {
+                TestFsObject::File { contents, .. } => contents.as_str(),
+                TestFsObject::Dir { .. } => panic!("Cannot get contents of a directory"),
+            }
+        }
+
+        fn get_children(&self) -> &[TestFsObject] {
+            match self {
+                TestFsObject::Dir { contents, .. } => contents.as_slice(),
+                TestFsObject::File { .. } => panic!("Cannot get children of a file"),
+            }
+        }
+
+        fn is_symlink(&self, base_path: &Path) -> bool {
+            match self {
+                TestFsObject::File { name, .. } => {
+                    debug!("Checking if file symlink for {:?} {:?}", base_path, name);
+                    let file_path = base_path.join(name);
+                    fs::symlink_metadata(file_path)
+                        .map(|meta| meta.file_type().is_symlink())
+                        .expect("Error checking symlink metadata")
+                }
+                TestFsObject::Dir { name, .. } => {
+                    debug!("Checking if dir symlink for {:?} {:?}", base_path, name);
+                    let dir_path = base_path.join(name);
+                    fs::symlink_metadata(dir_path)
+                        .map(|meta| meta.file_type().is_symlink())
+                        .expect("Error checking symlink metadata")
+                }
+            }
+        }
+
+        fn get_name(&self) -> &str {
+            match self {
+                TestFsObject::File { name, .. } => name,
+                TestFsObject::Dir { name, .. } => name,
+            }
+        }
+    }
 
     #[test]
     fn simple_test() {
@@ -443,27 +583,31 @@ mod tests {
         let dir = tempdir().unwrap();
         let dir_path = dir.path();
 
-        let file1_path = dir_path.join("file1.txt");
-        let file2_path = dir_path.join("file2.txt");
-        let file3_path = dir_path.join("file3.txt");
+        let test_dir = TestFsObject::Dir {
+            name: "test_dir".to_string(),
+            contents: vec![
+                TestFsObject::File {
+                    name: "file1.txt".to_string(),
+                    contents: "duplicate content".to_string(),
+                },
+                TestFsObject::File {
+                    name: "file2.txt".to_string(),
+                    contents: "duplicate content".to_string(),
+                },
+                TestFsObject::File {
+                    name: "file3.txt".to_string(),
+                    contents: "unique content".to_string(),
+                },
+            ],
+        };
 
-        // Create test files
-        {
-            let mut f1 = File::create(&file1_path).unwrap();
-            write!(f1, "duplicate content").unwrap();
+        test_dir.create(dir_path);
 
-            let mut f2 = File::create(&file2_path).unwrap();
-            write!(f2, "duplicate content").unwrap();
+        let test_view = test_dir.get_view(dir_path);
 
-            let mut f3 = File::create(&file3_path).unwrap();
-            write!(f3, "unique content").unwrap();
+        let dir_path = test_dir.get_path(dir_path);
 
-            f1.flush().unwrap();
-            f2.flush().unwrap();
-            f3.flush().unwrap();
-        }
-
-        apply(dir_path).unwrap();
+        apply(&dir_path).unwrap();
 
         let originals_dir = dir_path.join(".mirage/originals");
 
@@ -472,67 +616,30 @@ mod tests {
         assert!(orig1.exists());
 
         // file1 should now be a symlink to file1 in .mirage/originals
-        assert!(fs::symlink_metadata(&file1_path)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(test_view.get_children()[0].is_symlink());
 
-        assert!(fs::symlink_metadata(&file2_path)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(test_view.get_children()[1].is_symlink());
 
         assert_eq!(
-            fs::canonicalize(read_link(&file2_path).unwrap()).unwrap(),
-            fs::canonicalize(orig1).unwrap()
+            fs::canonicalize(read_link(&test_view.get_children()[0].get_full_path()).unwrap())
+                .unwrap(),
+            fs::canonicalize(&orig1).unwrap()
         );
 
-        assert!(fs::symlink_metadata(&file3_path)
-            .unwrap()
+        assert_eq!(
+            fs::canonicalize(read_link(&test_view.get_children()[1].get_full_path()).unwrap())
+                .unwrap(),
+            fs::canonicalize(&orig1).unwrap()
+        );
+
+        assert!(&test_view.get_children()[2]
+            .get_fs_metadata()
             .file_type()
             .is_file());
 
-        revert(dir_path).unwrap();
+        revert(&dir_path).unwrap();
 
-        // Check if the original files are restored
-
-        assert!(file1_path.exists());
-        assert!(file2_path.exists());
-        assert!(file3_path.exists());
-
-        // Check if the symlinks are removed
-        assert!(fs::symlink_metadata(&file1_path)
-            .unwrap()
-            .file_type()
-            .is_file());
-        assert!(fs::symlink_metadata(&file2_path)
-            .unwrap()
-            .file_type()
-            .is_file());
-        assert!(fs::symlink_metadata(&file3_path)
-            .unwrap()
-            .file_type()
-            .is_file());
-
-        // Check if contents are the same
-        let mut file1_content = String::new();
-        let mut file2_content = String::new();
-        let mut file3_content = String::new();
-        File::open(&file1_path)
-            .unwrap()
-            .read_to_string(&mut file1_content)
-            .unwrap();
-        File::open(&file2_path)
-            .unwrap()
-            .read_to_string(&mut file2_content)
-            .unwrap();
-        File::open(&file3_path)
-            .unwrap()
-            .read_to_string(&mut file3_content)
-            .unwrap();
-        assert_eq!(file1_content, "duplicate content");
-        assert_eq!(file2_content, "duplicate content");
-        assert_eq!(file3_content, "unique content");
+        test_view.verify();
 
         // Check if mirage directory is removed
 
